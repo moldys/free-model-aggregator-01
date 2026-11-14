@@ -239,6 +239,159 @@ async function pipeStream(stream: ReadableStream<Uint8Array>, res: ServerRespons
   }
 }
 
+function safeArgs(value: unknown): Json {
+  if (isRecord(value)) return value;
+  if (typeof value === 'string') {
+    try {
+      const v: unknown = JSON.parse(value);
+      return isRecord(v) ? v : {};
+    } catch {
+      return {};
+    }
+  }
+  return {};
+}
+
+/** OpenAI Chat Completions body as an Anthropic Messages request. */
+function openAIToAnthropicReq(body: Json, model: string): Json {
+  const src = Array.isArray(body.messages) ? body.messages : [];
+  const messages: Json[] = [];
+  let system = '';
+  for (const raw of src) {
+    if (!isRecord(raw)) continue;
+    const role = raw.role;
+    if (role === 'system') { system += typeof raw.content === 'string' ? raw.content : ''; continue; }
+    if (role === 'tool') {
+      messages.push({ role: 'user', content: [{ type: 'tool_result', tool_use_id: typeof raw.tool_call_id === 'string' ? raw.tool_call_id : '', content: typeof raw.content === 'string' ? raw.content : '' }] });
+      continue;
+    }
+    const parts: Json[] = [];
+    const c = raw.content;
+    if (typeof c === 'string') parts.push({ type: 'text', text: c });
+    else if (Array.isArray(c)) {
+      for (const b of c) {
+        if (!isRecord(b)) continue;
+        if (typeof b.text === 'string') parts.push({ type: 'text', text: b.text });
+        else if (b.type === 'image_url' || b.type === 'image') parts.push({ type: 'image', source: { type: 'base64', media_type: 'image/png', data: '' } });
+      }
+    }
+    if (role === 'assistant') {
+      const calls = Array.isArray(raw.tool_calls) ? raw.tool_calls : [];
+      const blocks: Json[] = [];
+      const t = parts.length > 0 && typeof parts[0].text === 'string' ? (parts[0].text as string) : '';
+      if (t !== '') blocks.push({ type: 'text', text: t });
+      for (const call of calls) {
+        if (!isRecord(call) || !isRecord(call.function)) continue;
+        blocks.push({ type: 'tool_use', id: typeof call.id === 'string' ? call.id : 'toolu_unknown', name: typeof call.function.name === 'string' ? call.function.name : '', input: safeArgs(call.function.arguments) });
+      }
+      if (blocks.length > 0) messages.push({ role: 'assistant', content: blocks });
+      continue;
+    }
+    if (parts.length > 0) messages.push({ role: 'user', content: parts });
+  }
+  const out: Json = { model, max_tokens: typeof body.max_tokens === 'number' ? body.max_tokens : 2048, messages };
+  if (system !== '') out.system = system;
+  if (typeof body.temperature === 'number') out.temperature = body.temperature;
+  if (Array.isArray(body.tools) && body.tools.length > 0) {
+    const tools: Json[] = [];
+    for (const raw of body.tools) {
+      if (!isRecord(raw) || !isRecord(raw.function) || typeof raw.function.name !== 'string') continue;
+      tools.push({ name: raw.function.name, description: typeof raw.function.description === 'string' ? raw.function.description : '', input_schema: isRecord(raw.function.parameters) ? raw.function.parameters : { type: 'object', properties: {} } });
+    }
+    if (tools.length > 0) out.tools = tools;
+  }
+  return out;
+}
+
+/** An Anthropic Messages answer as a Chat Completions object. */
+function anthropicToOpenAIAnswer(body: Json, model: string): Json {
+  const content = Array.isArray(body.content) ? body.content : [];
+  let text = '';
+  const calls: Json[] = [];
+  for (const blk of content) {
+    if (!isRecord(blk)) continue;
+    if (blk.type === 'text' && typeof blk.text === 'string') text += blk.text;
+    else if (blk.type === 'tool_use') calls.push({ id: typeof blk.id === 'string' ? blk.id : 'toolu_unknown', type: 'function', function: { name: typeof blk.name === 'string' ? blk.name : '', arguments: JSON.stringify(isRecord(blk.input) ? blk.input : {}) } });
+  }
+  const usage = isRecord(body.usage) ? body.usage : {};
+  const inTok = typeof usage.input_tokens === 'number' ? usage.input_tokens : 0;
+  const outTok = typeof usage.output_tokens === 'number' ? usage.output_tokens : 0;
+  return {
+    id: typeof body.id === 'string' ? body.id : 'chatcmpl-anthropic',
+    object: 'chat.completion',
+    created: 1767225600,
+    model,
+    choices: [{ index: 0, message: { role: 'assistant', content: text !== '' ? text : null, ...(calls.length > 0 ? { tool_calls: calls } : {}) }, finish_reason: body.stop_reason === 'max_tokens' ? 'length' : body.stop_reason === 'tool_use' ? 'tool_calls' : 'stop' }],
+    usage: { prompt_tokens: inTok, completion_tokens: outTok, total_tokens: inTok + outTok },
+  };
+}
+
+/** OpenAI Chat Completions body as a Gemini generateContent request. */
+function openAIToGemini(body: Json, model: string): Json {
+  const src = Array.isArray(body.messages) ? body.messages : [];
+  const contents: Json[] = [];
+  let system = '';
+  for (const raw of src) {
+    if (!isRecord(raw)) continue;
+    if (raw.role === 'system') { system += typeof raw.content === 'string' ? raw.content : ''; continue; }
+    const role = raw.role === 'assistant' ? 'model' : 'user';
+    const parts: Json[] = [];
+    const c = raw.content;
+    if (typeof c === 'string') parts.push({ text: c });
+    else if (Array.isArray(c)) {
+      for (const b of c) {
+        if (!isRecord(b)) continue;
+        if (typeof b.text === 'string') parts.push({ text: b.text });
+        else if (b.type === 'image_url' || b.type === 'image') parts.push({ inline_data: { mime_type: 'image/png', data: '' } });
+      }
+    }
+    if (raw.role === 'tool') parts.push({ text: '[tool result] ' + (typeof raw.content === 'string' ? raw.content : '') });
+    if (parts.length > 0) contents.push({ role, parts });
+  }
+  const out: Json = { contents };
+  if (system !== '') out.systemInstruction = { parts: [{ text: system }] };
+  const cfg: Json = {};
+  if (typeof body.temperature === 'number') cfg.temperature = body.temperature;
+  if (typeof body.max_tokens === 'number') cfg.maxOutputTokens = body.max_tokens;
+  if (Object.keys(cfg).length > 0) out.generationConfig = cfg;
+  return out;
+}
+
+/** A Gemini generateContent answer as a Chat Completions object. */
+function geminiToOpenAI(body: Json, model: string): Json {
+  const cands = Array.isArray(body.candidates) ? body.candidates : [];
+  const cand = isRecord(cands[0]) ? cands[0] : {};
+  const content = isRecord(cand.content) ? cand.content : {};
+  const parts = Array.isArray(content.parts) ? content.parts : [];
+  let text = '';
+  for (const p of parts) {
+    if (isRecord(p) && typeof p.text === 'string') text += p.text;
+  }
+  const usage = isRecord(body.usageMetadata) ? body.usageMetadata : {};
+  const inTok = typeof usage.promptTokenCount === 'number' ? usage.promptTokenCount : 0;
+  const outTok = typeof usage.candidatesTokenCount === 'number' ? usage.candidatesTokenCount : 0;
+  return {
+    id: 'chatcmpl-gemini',
+    object: 'chat.completion',
+    created: 1767225600,
+    model,
+    choices: [{ index: 0, message: { role: 'assistant', content: text !== '' ? text : null }, finish_reason: 'stop' }],
+    usage: { prompt_tokens: inTok, completion_tokens: outTok, total_tokens: inTok + outTok },
+  };
+}
+
+async function callProviderAnthropic(route: Route, body: Json): Promise<Response> {
+  const base = joinBase(ENV_URL, route.probe.provider.base);
+  const headers: Record<string, string> = { 'content-type': 'application/json', 'anthropic-version': '2023-06-01', ...authHeaders(route.probe.provider.auth, route.probe.provider.key) };
+  return fetch(`${base}/v1/messages`, { method: 'POST', headers, body: JSON.stringify(openAIToAnthropicReq(body, route.model.id)) });
+}
+
+async function callProviderGemini(route: Route, body: Json): Promise<Response> {
+  const base = joinBase(ENV_URL, route.probe.provider.base);
+  const headers: Record<string, string> = { 'content-type': 'application/json', ...authHeaders(route.probe.provider.auth, route.probe.provider.key) };
+  return fetch(`${base}/v1beta/models/${route.model.id}:generateContent`, { method: 'POST', headers, body: JSON.stringify(openAIToGemini(body, route.model.id)) });
+}
+
 /** POST /v1/chat/completions: an OpenAI-shaped client, answered by a free provider with failover. */
 async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const body = await readJson(req);
@@ -246,10 +399,12 @@ async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const routes = routesFor(requirementsFor(body));
   if (routes.length === 0) return sendError(res, 'openai', 503, 'no_free_model', 'no free model on the directory meets this request');
   for (const route of routes) {
-    if (route.probe.provider.wire !== 'openai') continue;
+    const wire = route.probe.provider.wire;
     let upstream: Response;
     try {
-      upstream = await callProvider(route, { ...body, model: route.model.id });
+      if (wire === 'anthropic') upstream = await callProviderAnthropic(route, { ...body, model: route.model.id });
+      else if (wire === 'gemini') upstream = await callProviderGemini(route, { ...body, model: route.model.id });
+      else upstream = await callProvider(route, { ...body, model: route.model.id });
     } catch {
       continue;
     }
@@ -258,9 +413,23 @@ async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
       await upstream.text();
       continue;
     }
-    if (body.stream === true && status < 300 && upstream.body !== null) {
+    if (body.stream === true && wire === 'openai' && status < 300 && upstream.body !== null) {
       res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
       await pipeStream(upstream.body, res);
+      return;
+    }
+    if (body.stream === true) {
+      await upstream.text();
+      continue;
+    }
+    if (wire === 'anthropic' && status < 300) {
+      const answer: unknown = await upstream.json();
+      sendJson(res, 200, anthropicToOpenAIAnswer(isRecord(answer) ? answer : {}, route.model.id));
+      return;
+    }
+    if (wire === 'gemini' && status < 300) {
+      const answer: unknown = await upstream.json();
+      sendJson(res, 200, geminiToOpenAI(isRecord(answer) ? answer : {}, route.model.id));
       return;
     }
     const text = await upstream.text();
@@ -278,11 +447,19 @@ async function messages(req: IncomingMessage, res: ServerResponse): Promise<void
   const routes = routesFor(requirementsFor(body));
   if (routes.length === 0) return sendError(res, 'anthropic', 503, 'overloaded_error', 'no free model on the directory meets this request');
   for (const route of routes) {
-    if (route.probe.provider.wire !== 'openai') continue;
+    const wire = route.probe.provider.wire;
     const requested = typeof body.model === 'string' && body.model !== '' ? body.model : route.model.id;
     let upstream: Response;
     try {
-      upstream = await callProvider(route, anthropicToOpenAI(body, route.model.id));
+      if (wire === 'anthropic') {
+        const base = joinBase(ENV_URL, route.probe.provider.base);
+        const headers: Record<string, string> = { 'content-type': 'application/json', 'anthropic-version': '2023-06-01', ...authHeaders(route.probe.provider.auth, route.probe.provider.key) };
+        upstream = await fetch(`${base}/v1/messages`, { method: 'POST', headers, body: JSON.stringify({ ...body, model: route.model.id }) });
+      } else if (wire === 'gemini') {
+        upstream = await callProviderGemini(route, { ...body, model: route.model.id });
+      } else {
+        upstream = await callProvider(route, anthropicToOpenAI(body, route.model.id));
+      }
     } catch {
       continue;
     }
@@ -293,11 +470,25 @@ async function messages(req: IncomingMessage, res: ServerResponse): Promise<void
     }
     if (body.stream === true && status < 300 && upstream.body !== null) {
       res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
-      for await (const event of anthropicEventsFromOpenAI(upstream.body, requested)) res.write(event);
-      res.end();
+      if (wire === 'anthropic') {
+        await pipeStream(upstream.body, res);
+      } else if (wire === 'gemini') {
+        const text = await upstream.text();
+        res.write(text);
+        res.end();
+      } else {
+        for await (const event of anthropicEventsFromOpenAI(upstream.body, requested)) res.write(event);
+        res.end();
+      }
       return;
     }
     if (status < 300) {
+      if (wire === 'anthropic') {
+        const text = await upstream.text();
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(text);
+        return;
+      }
       const answer: unknown = await upstream.json();
       sendJson(res, 200, openAIToAnthropic(isRecord(answer) ? answer : {}, requested));
       return;
