@@ -343,7 +343,11 @@ function openAIToGemini(body: Json, model: string): Json {
       for (const b of c) {
         if (!isRecord(b)) continue;
         if (typeof b.text === 'string') parts.push({ text: b.text });
-        else if (b.type === 'image_url' || b.type === 'image') parts.push({ inline_data: { mime_type: 'image/png', data: '' } });
+        else if (b.type === 'image_url' || b.type === 'image') {
+          const u = isRecord(b.image_url) && typeof b.image_url.url === 'string' ? b.image_url.url : '';
+          const mt = /^data:([^;,]+);base64,(.*)$/s.exec(u);
+          parts.push({ inline_data: { mime_type: mt ? mt[1] : 'image/png', data: mt ? mt[2] : '' } });
+        }
       }
     }
     if (raw.role === 'tool') parts.push({ text: '[tool result] ' + (typeof raw.content === 'string' ? raw.content : '') });
@@ -418,6 +422,7 @@ function writeOpenAIStream(res: ServerResponse, answer: Json, model: string): vo
   if (calls.length > 0) res.write(sseEvent('chat.completion.chunk', { id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { tool_calls: calls }, finish_reason: null }] }));
   res.write(sseEvent('chat.completion.chunk', { id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: {}, finish_reason: finish }] }));
   res.write(sseEvent('chat.completion.chunk', { id, object: 'chat.completion.chunk', created, model, choices: [], usage }));
+  res.write('data: [DONE]\n\n');
   res.end();
 }
 
@@ -445,13 +450,12 @@ async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
       continue;
     }
     if (body.stream === true) {
-      if (wire === 'openai' && upstream.body !== null) {
-        res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
-        await pipeStream(upstream.body, res);
-        return;
-      }
-      const raw: unknown = await upstream.json();
-      const conv = wire === 'anthropic' ? anthropicToOpenAIAnswer(isRecord(raw) ? raw : {}, route.model.id) : geminiToOpenAI(isRecord(raw) ? raw : {}, route.model.id);
+      let raw: unknown = await upstream.json();
+      let conv: Json;
+      if (wire === 'anthropic') conv = anthropicToOpenAIAnswer(isRecord(raw) ? raw : {}, route.model.id);
+      else if (wire === 'gemini') conv = geminiToOpenAI(isRecord(raw) ? raw : {}, route.model.id);
+      else conv = isRecord(raw) ? raw : {};
+      if (!isRecord(conv.usage)) conv.usage = { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
       writeOpenAIStream(res, conv, route.model.id);
       return;
     }
@@ -466,8 +470,16 @@ async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
       return;
     }
     const text = await upstream.text();
+    let body2: Json = {};
+    try {
+      const v: unknown = JSON.parse(text);
+      if (isRecord(v)) body2 = v;
+    } catch {
+      body2 = {};
+    }
+    if (!isRecord(body2.usage)) body2.usage = { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
     res.writeHead(status, { 'content-type': upstream.headers.get('content-type') ?? 'application/json' });
-    res.end(text);
+    res.end(JSON.stringify(body2));
     return;
   }
   sendError(res, 'openai', 503, 'no_free_model', 'every candidate provider refused the request (402/429/5xx)');
