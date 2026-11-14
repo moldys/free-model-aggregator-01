@@ -77,6 +77,7 @@ import {
   openAIError,
   openAIModelList,
   openAIToAnthropic,
+  sseEvent,
   type ServedModel,
 } from './lib/wire.ts';
 
@@ -350,6 +351,14 @@ function openAIToGemini(body: Json, model: string): Json {
   }
   const out: Json = { contents };
   if (system !== '') out.systemInstruction = { parts: [{ text: system }] };
+  if (Array.isArray(body.tools) && body.tools.length > 0) {
+    const fns: Json[] = [];
+    for (const raw of body.tools) {
+      if (!isRecord(raw) || !isRecord(raw.function) || typeof raw.function.name !== 'string') continue;
+      fns.push({ name: raw.function.name, description: typeof raw.function.description === 'string' ? raw.function.description : '', parameters: isRecord(raw.function.parameters) ? raw.function.parameters : { type: 'object', properties: {} } });
+    }
+    if (fns.length > 0) out.tools = [{ functionDeclarations: fns }];
+  }
   const cfg: Json = {};
   if (typeof body.temperature === 'number') cfg.temperature = body.temperature;
   if (typeof body.max_tokens === 'number') cfg.maxOutputTokens = body.max_tokens;
@@ -392,6 +401,26 @@ async function callProviderGemini(route: Route, body: Json): Promise<Response> {
   return fetch(`${base}/v1beta/models/${route.model.id}:generateContent`, { method: 'POST', headers, body: JSON.stringify(openAIToGemini(body, route.model.id)) });
 }
 
+/** Emit a Chat Completions SSE stream from one non-streamed answer object. */
+function writeOpenAIStream(res: ServerResponse, answer: Json, model: string): void {
+  const id = typeof answer.id === 'string' ? answer.id : 'chatcmpl-agg';
+  const created = 1767225600;
+  const choices0 = Array.isArray(answer.choices) ? answer.choices : [];
+  const c0 = isRecord(choices0[0]) ? choices0[0] : {};
+  const msg = isRecord(c0.message) ? c0.message : {};
+  const content = typeof msg.content === 'string' ? msg.content : '';
+  const calls: Json[] = Array.isArray(msg.tool_calls) ? msg.tool_calls : [];
+  const finish = typeof c0.finish_reason === 'string' ? c0.finish_reason : 'stop';
+  const usage = isRecord(answer.usage) ? answer.usage : {};
+  res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
+  res.write(sseEvent('chat.completion.chunk', { id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }] }));
+  if (content !== '') res.write(sseEvent('chat.completion.chunk', { id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { content }, finish_reason: null }] }));
+  if (calls.length > 0) res.write(sseEvent('chat.completion.chunk', { id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { tool_calls: calls }, finish_reason: null }] }));
+  res.write(sseEvent('chat.completion.chunk', { id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: {}, finish_reason: finish }] }));
+  res.write(sseEvent('chat.completion.chunk', { id, object: 'chat.completion.chunk', created, model, choices: [], usage }));
+  res.end();
+}
+
 /** POST /v1/chat/completions: an OpenAI-shaped client, answered by a free provider with failover. */
 async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const body = await readJson(req);
@@ -400,11 +429,13 @@ async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
   if (routes.length === 0) return sendError(res, 'openai', 503, 'no_free_model', 'no free model on the directory meets this request');
   for (const route of routes) {
     const wire = route.probe.provider.wire;
+    const upBody: Json = { ...body, model: route.model.id };
+    if (body.stream === true && wire !== 'openai') upBody.stream = false;
     let upstream: Response;
     try {
-      if (wire === 'anthropic') upstream = await callProviderAnthropic(route, { ...body, model: route.model.id });
-      else if (wire === 'gemini') upstream = await callProviderGemini(route, { ...body, model: route.model.id });
-      else upstream = await callProvider(route, { ...body, model: route.model.id });
+      if (wire === 'anthropic') upstream = await callProviderAnthropic(route, upBody);
+      else if (wire === 'gemini') upstream = await callProviderGemini(route, upBody);
+      else upstream = await callProvider(route, upBody);
     } catch {
       continue;
     }
@@ -413,14 +444,16 @@ async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
       await upstream.text();
       continue;
     }
-    if (body.stream === true && wire === 'openai' && status < 300 && upstream.body !== null) {
-      res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
-      await pipeStream(upstream.body, res);
-      return;
-    }
     if (body.stream === true) {
-      await upstream.text();
-      continue;
+      if (wire === 'openai' && upstream.body !== null) {
+        res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
+        await pipeStream(upstream.body, res);
+        return;
+      }
+      const raw: unknown = await upstream.json();
+      const conv = wire === 'anthropic' ? anthropicToOpenAIAnswer(isRecord(raw) ? raw : {}, route.model.id) : geminiToOpenAI(isRecord(raw) ? raw : {}, route.model.id);
+      writeOpenAIStream(res, conv, route.model.id);
+      return;
     }
     if (wire === 'anthropic' && status < 300) {
       const answer: unknown = await upstream.json();
