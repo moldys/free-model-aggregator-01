@@ -344,9 +344,9 @@ function openAIToGemini(body: Json, model: string): Json {
         if (!isRecord(b)) continue;
         if (typeof b.text === 'string') parts.push({ text: b.text });
         else if (b.type === 'image_url' || b.type === 'image') {
-          const u = isRecord(b.image_url) && typeof b.image_url.url === 'string' ? b.image_url.url : '';
+          const u = typeof b === 'string' ? b : (typeof b.image_url === 'string' ? b.image_url : (isRecord(b.image_url) && typeof b.image_url.url === 'string' ? b.image_url.url : (isRecord(b.image) && typeof b.image.url === 'string' ? b.image.url : '')));
           const mt = /^data:([^;,]+);base64,(.*)$/s.exec(u);
-          parts.push({ inline_data: { mime_type: mt ? mt[1] : 'image/png', data: mt ? mt[2] : '' } });
+          parts.push({ inlineData: { mimeType: mt ? mt[1] : 'image/png', data: mt ? mt[2] : '' } });
         }
       }
     }
@@ -366,6 +366,7 @@ function openAIToGemini(body: Json, model: string): Json {
   const cfg: Json = {};
   if (typeof body.temperature === 'number') cfg.temperature = body.temperature;
   if (typeof body.max_tokens === 'number') cfg.maxOutputTokens = body.max_tokens;
+  if (Array.isArray(body.stop) && body.stop.length > 0) cfg.stopSequences = body.stop;
   if (Object.keys(cfg).length > 0) out.generationConfig = cfg;
   return out;
 }
@@ -435,7 +436,7 @@ async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
   for (const route of routes) {
     const wire = route.probe.provider.wire;
     const upBody: Json = { ...body, model: route.model.id };
-    if (body.stream === true && wire !== 'openai') upBody.stream = false;
+    if (body.stream === true) upBody.stream = false;
     let upstream: Response;
     try {
       if (wire === 'anthropic') upstream = await callProviderAnthropic(route, upBody);
