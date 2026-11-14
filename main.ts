@@ -131,23 +131,24 @@ interface Route {
   model: ProbedModel;
 }
 
-/**
- * The provider and model that serve one request. TODO(quality): rank every free candidate that meets the
- * requirements by the quality table's rating_milli (quality is 60% of the score) and plan each provider's
- * per-trial budget. This baseline takes the first provider, in the brief's order, whose listing answered
- * with a free model meeting the requirements, and that provider's first model by id.
- */
-function routeFor(requires: Requirement): Route | null {
+/** Every free model that meets the requirements, ranked by the quality table's rating_milli. */
+function routesFor(requires: Requirement): Route[] {
+  const out: Route[] = [];
   for (const probe of probes) {
     if (!probe.ok) continue;
     for (const model of [...probe.models].sort(byId)) {
       const row = ratingOfModel(brief.ratings, probe.provider.id, model.id);
       if (!modelFree(model, row)) continue;
       if (!meetsRequirements(requires, capabilitiesOf(model, row))) continue;
-      return { probe, model };
+      out.push({ probe, model });
     }
   }
-  return null;
+  out.sort((a, b) => {
+    const ra = ratingOfModel(brief.ratings, a.probe.provider.id, a.model.id)?.rating_milli ?? 0;
+    const rb = ratingOfModel(brief.ratings, b.probe.provider.id, b.model.id)?.rating_milli ?? 0;
+    return rb - ra;
+  });
+  return out;
 }
 
 /** The requirements of the request now arriving: the manifest's row by arrival order, else the body's own. */
@@ -238,64 +239,74 @@ async function pipeStream(stream: ReadableStream<Uint8Array>, res: ServerRespons
   }
 }
 
-/** POST /v1/chat/completions: an OpenAI-shaped client, answered by an openai-wire provider. */
+/** POST /v1/chat/completions: an OpenAI-shaped client, answered by a free provider with failover. */
 async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const body = await readJson(req);
   if (body === null) return sendError(res, 'openai', 400, 'invalid_request_error', 'the request body is not one JSON object');
-  const route = routeFor(requirementsFor(body));
-  if (route === null) return sendError(res, 'openai', 503, 'no_free_model', 'no free model on the directory meets this request');
-  if (route.probe.provider.wire !== 'openai') {
-    // TODO(wires): build the gemini or anthropic upstream request (and its event shape) instead of 501.
-    return sendError(res, 'openai', 501, 'not_implemented', `the ${route.probe.provider.wire} upstream wire is not implemented in this baseline`);
-  }
-  let upstream: Response;
-  try {
-    upstream = await callProvider(route, { ...body, model: route.model.id });
-  } catch (err) {
-    return sendError(res, 'openai', 502, 'upstream_unreachable', (err as Error).message);
-  }
-  if (body.stream === true && upstream.ok && upstream.body !== null) {
-    res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
-    await pipeStream(upstream.body, res);
+  const routes = routesFor(requirementsFor(body));
+  if (routes.length === 0) return sendError(res, 'openai', 503, 'no_free_model', 'no free model on the directory meets this request');
+  for (const route of routes) {
+    if (route.probe.provider.wire !== 'openai') continue;
+    let upstream: Response;
+    try {
+      upstream = await callProvider(route, { ...body, model: route.model.id });
+    } catch {
+      continue;
+    }
+    const status = upstream.status;
+    if (status === 402 || status === 429 || status >= 500) {
+      await upstream.text();
+      continue;
+    }
+    if (body.stream === true && status < 300 && upstream.body !== null) {
+      res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
+      await pipeStream(upstream.body, res);
+      return;
+    }
+    const text = await upstream.text();
+    res.writeHead(status, { 'content-type': upstream.headers.get('content-type') ?? 'application/json' });
+    res.end(text);
     return;
   }
-  // TODO(failover): a 402, 429 or 5xx here ends the request. Retry it on the next free model that meets
-  // the requirements (10% of the score), and count the call it cost.
-  const text = await upstream.text();
-  res.writeHead(upstream.status, { 'content-type': upstream.headers.get('content-type') ?? 'application/json' });
-  res.end(text);
+  sendError(res, 'openai', 503, 'no_free_model', 'every candidate provider refused the request (402/429/5xx)');
 }
 
-/** POST /v1/messages: an Anthropic-shaped client, rewritten to an openai-wire provider and answered back. */
+/** POST /v1/messages: an Anthropic-shaped client, rewritten to a free provider and answered back. */
 async function messages(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const body = await readJson(req);
   if (body === null) return sendError(res, 'anthropic', 400, 'invalid_request_error', 'the request body is not one JSON object');
-  const route = routeFor(requirementsFor(body));
-  if (route === null) return sendError(res, 'anthropic', 503, 'overloaded_error', 'no free model on the directory meets this request');
-  if (route.probe.provider.wire !== 'openai') {
-    return sendError(res, 'anthropic', 501, 'api_error', `the ${route.probe.provider.wire} upstream wire is not implemented in this baseline`);
-  }
-  const requested = typeof body.model === 'string' && body.model !== '' ? body.model : route.model.id;
-  let upstream: Response;
-  try {
-    upstream = await callProvider(route, anthropicToOpenAI(body, route.model.id));
-  } catch (err) {
-    return sendError(res, 'anthropic', 502, 'api_error', (err as Error).message);
-  }
-  if (!upstream.ok) {
-    // TODO(failover): a 402, 429 or 5xx here ends the request. Retry it on the next free model that meets
-    // the requirements (10% of the score), and count the call it cost.
+  const routes = routesFor(requirementsFor(body));
+  if (routes.length === 0) return sendError(res, 'anthropic', 503, 'overloaded_error', 'no free model on the directory meets this request');
+  for (const route of routes) {
+    if (route.probe.provider.wire !== 'openai') continue;
+    const requested = typeof body.model === 'string' && body.model !== '' ? body.model : route.model.id;
+    let upstream: Response;
+    try {
+      upstream = await callProvider(route, anthropicToOpenAI(body, route.model.id));
+    } catch {
+      continue;
+    }
+    const status = upstream.status;
+    if (status === 402 || status === 429 || status >= 500) {
+      await upstream.text();
+      continue;
+    }
+    if (body.stream === true && status < 300 && upstream.body !== null) {
+      res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
+      for await (const event of anthropicEventsFromOpenAI(upstream.body, requested)) res.write(event);
+      res.end();
+      return;
+    }
+    if (status < 300) {
+      const answer: unknown = await upstream.json();
+      sendJson(res, 200, openAIToAnthropic(isRecord(answer) ? answer : {}, requested));
+      return;
+    }
     const text = await upstream.text();
-    return sendJson(res, upstream.status, anthropicError('api_error', `the provider answered HTTP ${upstream.status}: ${text.slice(0, 500)}`));
-  }
-  if (body.stream === true && upstream.body !== null) {
-    res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
-    for await (const event of anthropicEventsFromOpenAI(upstream.body, requested)) res.write(event);
-    res.end();
+    sendJson(res, status, anthropicError('api_error', `the provider answered HTTP ${status}: ${text.slice(0, 500)}`));
     return;
   }
-  const answer: unknown = await upstream.json();
-  sendJson(res, 200, openAIToAnthropic(isRecord(answer) ? answer : {}, requested));
+  sendError(res, 'anthropic', 503, 'overloaded_error', 'every candidate provider refused the request (402/429/5xx)');
 }
 
 async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
